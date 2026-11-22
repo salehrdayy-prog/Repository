@@ -13,14 +13,17 @@ from telegram.ext import Application, CommandHandler, MessageHandler, ContextTyp
 # =========================================
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
+
 WEATHER_URL = "https://api.open-meteo.com/v1/forecast"
 GEOCODING_URL = "https://geocoding-api.open-meteo.com/v1/search"
+
 CITIES_FILE = os.path.join(os.path.dirname(__file__), "cities.json")
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(message)s"
 )
+
 log = logging.getLogger(__name__)
 
 # =========================================
@@ -30,8 +33,10 @@ log = logging.getLogger(__name__)
 try:
     with open(CITIES_FILE, "r", encoding="utf-8") as f:
         PROVINCES = json.load(f)
+
 except (FileNotFoundError, json.JSONDecodeError) as exc:
     raise RuntimeError(f"Cannot load cities.json: {exc}")
+
 
 # =========================================
 # TIME OPTIONS
@@ -43,6 +48,7 @@ TIME_OPTIONS = {
     "🌌 ۲ شب بعد": 2,
     "🌠 ۳ شب بعد": 3,
 }
+
 
 # =========================================
 # WEATHER CODES
@@ -79,12 +85,16 @@ WEATHER_CODES = {
     99: "رعدوبرق و تگرگ شدید ⛈",
 }
 
+
 # =========================================
 # KEYBOARDS
 # =========================================
 
 def make_keyboard(rows, extra=None):
-    buttons = [[KeyboardButton(x) for x in row] for row in rows]
+    buttons = [
+        [KeyboardButton(x) for x in row]
+        for row in rows
+    ]
 
     if extra:
         buttons.append([KeyboardButton(extra)])
@@ -97,14 +107,27 @@ def make_keyboard(rows, extra=None):
 
 def provinces_keyboard():
     names = list(PROVINCES.keys())
-    rows = [names[i:i + 3] for i in range(0, len(names), 3)]
+
+    rows = [
+        names[i:i + 3]
+        for i in range(0, len(names), 3)
+    ]
+
     return make_keyboard(rows, "❌ لغو")
 
 
 def cities_keyboard(province):
     cities = PROVINCES.get(province, [])
-    rows = [cities[i:i + 2] for i in range(0, len(cities), 2)]
-    return make_keyboard(rows, "🔙 بازگشت به استان‌ها")
+
+    rows = [
+        cities[i:i + 2]
+        for i in range(0, len(cities), 2)
+    ]
+
+    return make_keyboard(
+        rows,
+        "🔙 بازگشت به استان‌ها"
+    )
 
 
 def time_keyboard():
@@ -121,51 +144,107 @@ def result_keyboard():
         ["🏙 تغییر شهر", "📍 تغییر استان"],
     ])
 
+
 # =========================================
 # GEOCODING
 # =========================================
 
-def get_coordinates(city):
-    try:
-        response = requests.get(
-            GEOCODING_URL,
-            params={
-                "name": city,
-                "count": 10,
-                "language": "fa",
-                "format": "json"
-            },
-            timeout=15
-        )
+def get_coordinates(city, province):
 
-        response.raise_for_status()
-        results = response.json().get("results", [])
+    # جستجو فقط با نام شهر انجام می‌شود.
+    # سپس نتیجه بر اساس کشور و استان بررسی می‌شود.
 
-        iran_result = next(
-            (item for item in results if item.get("country_code") == "IR"),
-            None
-        )
+    for language in ("fa", "en"):
 
-        if not iran_result:
-            return None
+        try:
+            response = requests.get(
+                GEOCODING_URL,
+                params={
+                    "name": city,
+                    "count": 20,
+                    "language": language,
+                    "format": "json"
+                },
+                timeout=20
+            )
 
-        return (
-            iran_result["latitude"],
-            iran_result["longitude"]
-        )
+            response.raise_for_status()
 
-    except (requests.RequestException, ValueError, KeyError) as exc:
-        log.warning("Geocoding failed for %s: %s", city, exc)
-        return None
+            results = response.json().get("results", [])
+
+            iran_results = [
+                item for item in results
+                if item.get("country_code") == "IR"
+            ]
+
+            if not iran_results:
+                log.warning(
+                    "No Iran geocoding results. City=%s Language=%s",
+                    city,
+                    language
+                )
+                continue
+
+            # تلاش برای پیدا کردن نتیجه متعلق به استان انتخاب‌شده
+            match = next(
+                (
+                    item for item in iran_results
+                    if province in str(item.get("admin1", ""))
+                ),
+                None
+            )
+
+            # اگر استان مطابقت نداشت، نتیجه اول ایران انتخاب می‌شود.
+            if match is None:
+                match = iran_results[0]
+
+            log.info(
+                "Geocoding successful: city=%s province=%s "
+                "lat=%s lon=%s",
+                match.get("name"),
+                match.get("admin1"),
+                match.get("latitude"),
+                match.get("longitude")
+            )
+
+            return (
+                match["latitude"],
+                match["longitude"]
+            )
+
+        except requests.RequestException:
+            log.exception(
+                "Geocoding HTTP error. City=%s Language=%s",
+                city,
+                language
+            )
+
+        except (ValueError, KeyError, TypeError):
+            log.exception(
+                "Geocoding data error. City=%s Language=%s",
+                city,
+                language
+            )
+
+    log.error(
+        "Could not find coordinates for city=%s province=%s",
+        city,
+        province
+    )
+
+    return None
+
 
 # =========================================
 # WEATHER FETCH
 # =========================================
 
-def fetch_weather(city, nights_ahead):
-    coordinates = get_coordinates(city)
+def fetch_weather(city, province, nights_ahead):
+
+    coordinates = get_coordinates(city, province)
 
     if not coordinates:
+        log.error("Coordinates not found for %s", city)
         return None
 
     latitude, longitude = coordinates
@@ -187,20 +266,33 @@ def fetch_weather(city, nights_ahead):
                     "weather_code"
                 )
             },
-            timeout=20
+            timeout=30
+        )
+
+        log.info(
+            "Weather API HTTP status: %s",
+            response.status_code
         )
 
         response.raise_for_status()
+
         data = response.json()
 
         hourly = data.get("hourly", {})
         times = hourly.get("time", [])
 
         if not times:
+            log.error(
+                "Weather API returned no hourly data. Response=%s",
+                data
+            )
             return None
 
         timezone_name = data.get("timezone", "UTC")
-        local_now = datetime.now(ZoneInfo(timezone_name))
+
+        local_now = datetime.now(
+            ZoneInfo(timezone_name)
+        )
 
         target_date = (
             local_now.date() + timedelta(days=nights_ahead)
@@ -208,22 +300,29 @@ def fetch_weather(city, nights_ahead):
 
         target_hour = 21
 
-        # اگر ساعت ۲۱ امشب گذشته باشد،
-        # امشب به شب آینده منتقل می‌شود.
+        # اگر ساعت ۹ شب گذشته باشد،
+        # گزینه امشب به شب آینده منتقل می‌شود.
         if nights_ahead == 0 and local_now.hour >= 21:
+
             target_date = (
                 local_now.date() + timedelta(days=1)
             ).isoformat()
 
-        target_time = f"{target_date}T{target_hour:02d}:00"
+        target_time = (
+            f"{target_date}T{target_hour:02d}:00"
+        )
 
         index = next(
-            (i for i, t in enumerate(times) if t == target_time),
+            (
+                i for i, t in enumerate(times)
+                if t == target_time
+            ),
             None
         )
 
-        # اگر ساعت ۲۱ موجود نبود، نزدیک‌ترین ساعت شب
+        # اگر ساعت ۲۱ موجود نبود، ساعت نزدیک شب انتخاب می‌شود.
         if index is None:
+
             candidates = [
                 i for i, t in enumerate(times)
                 if t.startswith(target_date)
@@ -231,18 +330,31 @@ def fetch_weather(city, nights_ahead):
             ]
 
             if not candidates:
+
+                log.error(
+                    "No evening forecast found for date=%s",
+                    target_date
+                )
+
                 return None
 
             index = min(
                 candidates,
-                key=lambda i: abs(int(times[i][11:13]) - target_hour)
+                key=lambda i: abs(
+                    int(times[i][11:13]) - target_hour
+                )
             )
 
         def get_value(key):
-            values = hourly.get(key, [])
-            return values[index] if index < len(values) else None
 
-        return {
+            values = hourly.get(key, [])
+
+            if index < len(values):
+                return values[index]
+
+            return None
+
+        weather_result = {
             "datetime": times[index],
             "timezone": timezone_name,
             "temperature": get_value("temperature_2m"),
@@ -253,40 +365,88 @@ def fetch_weather(city, nights_ahead):
             "code": get_value("weather_code"),
         }
 
-    except (requests.RequestException, ValueError, KeyError) as exc:
-        log.warning("Weather request failed for %s: %s", city, exc)
+        log.info(
+            "Weather successfully fetched for city=%s date=%s",
+            city,
+            weather_result["datetime"]
+        )
+
+        return weather_result
+
+    except requests.HTTPError:
+
+        log.exception(
+            "Weather API returned HTTP error for city=%s",
+            city
+        )
+
         return None
+
+    except requests.Timeout:
+
+        log.error(
+            "Weather API timeout for city=%s",
+            city
+        )
+
+        return None
+
+    except requests.RequestException:
+
+        log.exception(
+            "Weather API connection error for city=%s",
+            city
+        )
+
+        return None
+
+    except (ValueError, KeyError, TypeError):
+
+        log.exception(
+            "Weather API response processing error for city=%s",
+            city
+        )
+
+        return None
+
 
 # =========================================
 # OBSERVATION RATING
 # =========================================
 
 def observation_rating(clouds, rain, wind):
+
     if clouds is None or rain is None or wind is None:
+
         return (
             "نامشخص",
             "داده کافی برای تخمین شرایط رصد در دست نیست."
         )
 
     if rain >= 50 or clouds >= 85 or wind >= 40:
+
         return (
             "نامناسب 🔴",
             "احتمالاً شرایط رصد چندان مناسب نیست."
         )
 
     if clouds <= 15 and rain <= 10 and wind <= 20:
+
         return (
             "خیلی خوب 🌟",
-            "پوشش ابر و بارندگی کم است؛ شرایط می‌تواند برای رصد مناسب باشد."
+            "پوشش ابر و بارندگی کم است؛ "
+            "شرایط می‌تواند برای رصد مناسب باشد."
         )
 
     if clouds <= 40 and rain <= 20 and wind <= 25:
+
         return (
             "مناسب 🟢",
             "شرایط نسبتاً خوبی برای رصد وجود دارد."
         )
 
     if clouds <= 70 and rain <= 30:
+
         return (
             "متوسط 🟡",
             "شاید بخش‌هایی از آسمان برای رصد قابل استفاده باشد."
@@ -297,11 +457,13 @@ def observation_rating(clouds, rain, wind):
         "ابر یا شرایط جوی می‌تواند رصد را دشوار کند."
     )
 
+
 # =========================================
 # START COMMAND
 # =========================================
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+
     context.user_data.clear()
 
     await update.message.reply_text(
@@ -310,11 +472,16 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup=provinces_keyboard()
     )
 
+
 # =========================================
 # MESSAGE HANDLER
 # =========================================
 
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def handle_message(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+
     text = (update.message.text or "").strip()
 
     province = context.user_data.get("province")
@@ -322,15 +489,18 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # CANCEL
     if text == "❌ لغو":
+
         context.user_data.clear()
 
         await update.message.reply_text(
             "لغو شد. برای شروع دوباره /start را بزنید."
         )
+
         return
 
     # PROVINCE SELECTION
     if text in PROVINCES:
+
         context.user_data["province"] = text
         context.user_data.pop("city", None)
 
@@ -339,10 +509,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "شهر خود را انتخاب کنید:",
             reply_markup=cities_keyboard(text)
         )
+
         return
 
     # BACK TO PROVINCES
     if text == "🔙 بازگشت به استان‌ها":
+
         context.user_data.pop("province", None)
         context.user_data.pop("city", None)
 
@@ -350,10 +522,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "استان خود را انتخاب کنید:",
             reply_markup=provinces_keyboard()
         )
+
         return
 
     # CITY SELECTION
     if province and text in PROVINCES.get(province, []):
+
         context.user_data["city"] = text
 
         await update.message.reply_text(
@@ -361,71 +535,96 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "برای چه زمانی گزارش را می‌خواهید؟",
             reply_markup=time_keyboard()
         )
+
         return
 
     # CHANGE CITY
     if text in ("🔙 تغییر شهر", "🏙 تغییر شهر"):
+
         if province:
+
             await update.message.reply_text(
                 "شهر خود را انتخاب کنید:",
                 reply_markup=cities_keyboard(province)
             )
+
         else:
+
             await update.message.reply_text(
                 "استان را انتخاب کنید:",
                 reply_markup=provinces_keyboard()
             )
+
         return
 
     # CHANGE PROVINCE
     if text == "📍 تغییر استان":
+
         context.user_data.clear()
 
         await update.message.reply_text(
             "استان خود را انتخاب کنید:",
             reply_markup=provinces_keyboard()
         )
+
         return
 
     # CHECK ANOTHER TIME
     if text == "🔄 بررسی زمان دیگر":
+
         if city:
+
             await update.message.reply_text(
                 "زمان موردنظر را انتخاب کنید:",
                 reply_markup=time_keyboard()
             )
+
         else:
+
             await update.message.reply_text(
                 "اول استان و شهر را انتخاب کنید:",
                 reply_markup=provinces_keyboard()
             )
+
         return
 
     # TIME SELECTION
     if text in TIME_OPTIONS:
+
         province = context.user_data.get("province")
         city = context.user_data.get("city")
 
         if not city or not province:
+
             await update.message.reply_text(
                 "ابتدا استان و شهر را انتخاب کنید.",
                 reply_markup=provinces_keyboard()
             )
+
             return
 
         await update.message.reply_text(
-            "⏳ در حال دریافت پیش‌بینی هوا...",
+            "⏳ در حال دریافت پیش‌بینی هوا...\n"
+            "لطفاً کمی صبر کنید.",
             reply_markup=time_keyboard()
         )
 
-        weather = fetch_weather(city, TIME_OPTIONS[text])
+        weather = fetch_weather(
+            city,
+            province,
+            TIME_OPTIONS[text]
+        )
 
         if not weather:
+
             await update.message.reply_text(
-                "❌ دریافت اطلاعات ناموفق بود.\n"
-                "کمی بعد دوباره امتحان کنید.",
+                "❌ دریافت پیش‌بینی ناموفق شد.\n\n"
+                "ممکن است سرویس هواشناسی یا جستجوی شهر "
+                "موقتاً در دسترس نباشد.\n\n"
+                "چند دقیقه بعد دوباره امتحان کنید.",
                 reply_markup=time_keyboard()
             )
+
             return
 
         rating, rating_text = observation_rating(
@@ -434,7 +633,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             weather["wind"]
         )
 
-        dt = datetime.fromisoformat(weather["datetime"])
+        dt = datetime.fromisoformat(
+            weather["datetime"]
+        )
+
         date_text = dt.strftime("%Y-%m-%d")
 
         report = (
@@ -445,12 +647,18 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"🏙 شهر: {city}\n"
             f"📅 تاریخ: {date_text}\n"
             f"🕘 ساعت پیش‌بینی: {dt.strftime('%H:%M')}\n\n"
-            f"🌤 وضعیت: {WEATHER_CODES.get(weather['code'], 'وضعیت نامشخص')}\n"
-            f"🌡 دما: {weather['temperature'] if weather['temperature'] is not None else '—'}°C\n"
-            f"💧 رطوبت: {weather['humidity'] if weather['humidity'] is not None else '—'}٪\n"
-            f"☁️ پوشش ابر: {weather['clouds'] if weather['clouds'] is not None else '—'}٪\n"
-            f"🌧 احتمال بارندگی: {weather['rain'] if weather['rain'] is not None else '—'}٪\n"
-            f"💨 سرعت باد: {weather['wind'] if weather['wind'] is not None else '—'} km/h\n\n"
+            f"🌤 وضعیت: "
+            f"{WEATHER_CODES.get(weather['code'], 'وضعیت نامشخص')}\n"
+            f"🌡 دما: "
+            f"{weather['temperature'] if weather['temperature'] is not None else '—'}°C\n"
+            f"💧 رطوبت: "
+            f"{weather['humidity'] if weather['humidity'] is not None else '—'}٪\n"
+            f"☁️ پوشش ابر: "
+            f"{weather['clouds'] if weather['clouds'] is not None else '—'}٪\n"
+            f"🌧 احتمال بارندگی: "
+            f"{weather['rain'] if weather['rain'] is not None else '—'}٪\n"
+            f"💨 سرعت باد: "
+            f"{weather['wind'] if weather['wind'] is not None else '—'} km/h\n\n"
             "━━━━━━━━━━━━━━━━━━\n"
             "🔭 تخمین شرایط رصد\n"
             "━━━━━━━━━━━━━━━━━━\n\n"
@@ -465,6 +673,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             report,
             reply_markup=result_keyboard()
         )
+
         return
 
     # UNKNOWN MESSAGE
@@ -473,23 +682,31 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "یا /start را بزنید."
     )
 
+
 # =========================================
 # MAIN
 # =========================================
 
 def main():
+
     if not BOT_TOKEN:
+
         raise RuntimeError(
             "BOT_TOKEN environment variable is missing. "
-            "Set it in your hosting platform secrets."
+            "Set it in GitHub Secrets."
         )
 
     app = Application.builder().token(BOT_TOKEN).build()
 
-    app.add_handler(CommandHandler("start", start))
+    app.add_handler(
+        CommandHandler("start", start)
+    )
 
     app.add_handler(
-        MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message)
+        MessageHandler(
+            filters.TEXT & ~filters.COMMAND,
+            handle_message
+        )
     )
 
     log.info("Bot started; polling Telegram...")
