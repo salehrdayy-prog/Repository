@@ -1,0 +1,286 @@
+import os
+import json
+import logging
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
+
+import requests
+from telegram import Update, ReplyKeyboardMarkup, KeyboardButton
+from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
+
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+WEATHER_URL = "https://api.open-meteo.com/v1/forecast"
+GEOCODING_URL = "https://geocoding-api.open-meteo.com/v1/search"
+CITIES_FILE = os.path.join(os.path.dirname(__file__), "cities.json")
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+log = logging.getLogger(__name__)
+
+
+
+with open(CITIES_FILE, "r", encoding="utf-8") as f:
+    PROVINCES = json.load(f)
+
+
+TIME_OPTIONS = {
+    "🌙 امشب": 0,
+    "🌆 فردا شب": 1,
+    "🌌 ۲ شب بعد": 2,
+    "🌠 ۳ شب بعد": 3,
+}
+
+
+WEATHER_CODES = {
+    0: "صاف ☀️", 1: "عمدتاً صاف 🌤", 2: "نیمه‌ابری ⛅", 3: "ابری ☁️",
+    45: "مه 🌫", 48: "مه یخ‌زده 🌫", 51: "نم‌نم باران 🌦", 53: "نم‌نم باران 🌦",
+    55: "نم‌نم باران شدید 🌧", 56: "نم‌نم باران یخ‌زده 🌧", 57: "نم‌نم باران یخ‌زده شدید 🌧",
+    61: "باران خفیف 🌧", 63: "باران 🌧", 65: "باران شدید 🌧", 66: "باران یخ‌زده 🌧", 67: "باران یخ‌زده شدید 🌧",
+    71: "برف خفیف 🌨", 73: "برف 🌨", 75: "برف شدید ❄️", 77: "دانه‌های برف ❄️",
+    80: "رگبار باران 🌦", 81: "رگبار 🌧", 82: "رگبار شدید 🌧", 85: "رگبار برف 🌨", 86: "رگبار برف شدید 🌨",
+    95: "رعدوبرق ⛈", 96: "رعدوبرق همراه تگرگ ⛈", 99: "رعدوبرق و تگرگ شدید ⛈"
+}
+
+
+def make_keyboard(rows, extra=None):
+    buttons = [[KeyboardButton(x) for x in row] for row in rows]
+    if extra:
+        buttons.append([KeyboardButton(extra)])
+    return ReplyKeyboardMarkup(buttons, resize_keyboard=True)
+
+
+def provinces_keyboard():
+    names = list(PROVINCES.keys())
+    rows = [names[i:i+3] for i in range(0, len(names), 3)]
+    return make_keyboard(rows, "❌ لغو")
+
+
+def cities_keyboard(province):
+    cities = PROVINCES.get(province, [])
+    rows = [cities[i:i+2] for i in range(0, len(cities), 2)]
+    return make_keyboard(rows, "🔙 بازگشت به استان‌ها")
+
+
+def time_keyboard():
+    return make_keyboard([
+        ["🌙 امشب", "🌆 فردا شب"],
+        ["🌌 ۲ شب بعد", "🌠 ۳ شب بعد"],
+        ["🔙 تغییر شهر"],
+    ])
+
+
+def result_keyboard():
+    return make_keyboard([
+        ["🔄 بررسی زمان دیگر"],
+        ["🏙 تغییر شهر", "📍 تغییر استان"],
+    ])
+
+
+def get_coordinates(city):
+    try:
+        r = requests.get(GEOCODING_URL, params={
+            "name": city, "count": 10, "language": "fa", "format": "json"
+        }, timeout=15)
+        r.raise_for_status()
+        results = r.json().get("results", [])
+        iran_result = next((x for x in results if x.get("country_code") == "IR"), None)
+        if not iran_result:
+            return None
+        return iran_result["latitude"], iran_result["longitude"]
+    except (requests.RequestException, ValueError, KeyError) as exc:
+        log.warning("Geocoding failed for %s: %s", city, exc)
+        return None
+
+
+def fetch_weather(city, nights_ahead):
+    coords = get_coordinates(city)
+    if not coords:
+        return None
+    lat, lon = coords
+    try:
+        r = requests.get(WEATHER_URL, params={
+            "latitude": lat,
+            "longitude": lon,
+            "timezone": "auto",
+            "forecast_days": 7,
+            "hourly": "temperature_2m,relative_humidity_2m,cloud_cover,precipitation_probability,wind_speed_10m,weather_code"
+        }, timeout=20)
+        r.raise_for_status()
+        data = r.json()
+        hourly = data.get("hourly", {})
+        times = hourly.get("time", [])
+        if not times:
+            return None
+
+        tz_name = data.get("timezone", "UTC")
+        local_now = datetime.now(ZoneInfo(tz_name))
+        target_date = (local_now.date() + timedelta(days=nights_ahead)).isoformat()
+        target_hour = 21
+        # If 9 PM has already passed for the "tonight" selection, use the next evening.
+        if nights_ahead == 0 and local_now.hour >= 21:
+            target_date = (local_now.date() + timedelta(days=1)).isoformat()
+
+        target_prefix = f"{target_date}T{target_hour:02d}:00"
+        index = next((i for i, t in enumerate(times) if t == target_prefix), None)
+        if index is None:
+            # Use a nearby evening hour if 21:00 isn't in the returned hourly list.
+            candidates = [i for i, t in enumerate(times) if t.startswith(target_date) and t[11:13] in {"20", "22", "23"}]
+            if not candidates:
+                return None
+            index = min(candidates, key=lambda i: abs(int(times[i][11:13]) - target_hour))
+
+        def at(key):
+            arr = hourly.get(key, [])
+            return arr[index] if index < len(arr) else None
+
+        return {
+            "datetime": times[index],
+            "timezone": tz_name,
+            "temperature": at("temperature_2m"),
+            "humidity": at("relative_humidity_2m"),
+            "clouds": at("cloud_cover"),
+            "rain": at("precipitation_probability"),
+            "wind": at("wind_speed_10m"),
+            "code": at("weather_code"),
+        }
+    except (requests.RequestException, ValueError, KeyError) as exc:
+        log.warning("Weather request failed for %s: %s", city, exc)
+        return None
+
+
+def observation_rating(clouds, rain, wind):
+    # This is a simple rule-of-thumb rating, not an astronomy/visibility forecast.
+    if clouds is None or rain is None or wind is None:
+        return "نامشخص", "داده کافی برای تخمین شرایط رصد در دست نیست."
+    if rain >= 50 or clouds >= 85 or wind >= 40:
+        return "نامناسب 🔴", "احتمالاً شرایط رصد چندان مناسب نیست."
+    if clouds <= 15 and rain <= 10 and wind <= 20:
+        return "خیلی خوب 🌟", "پوشش ابر و بارندگی کم است؛ شرایط می‌تواند برای رصد مناسب باشد."
+    if clouds <= 40 and rain <= 20 and wind <= 25:
+        return "مناسب 🟢", "شرایط نسبتاً خوبی برای رصد وجود دارد."
+    if clouds <= 70 and rain <= 30:
+        return "متوسط 🟡", "شاید بخش‌هایی از آسمان برای رصد قابل استفاده باشد."
+    return "ضعیف 🟠", "ابر یا شرایط جوی می‌تواند رصد را دشوار کند."
+
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data.clear()
+    await update.message.reply_text(
+        "🌌 به ربات گزارش وضعیت آسمان خوش آمدید!\n\nبرای شروع، استان خود را انتخاب کنید:",
+        reply_markup=provinces_keyboard()
+    )
+
+
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = (update.message.text or "").strip()
+    province = context.user_data.get("province")
+    city = context.user_data.get("city")
+
+    if text == "❌ لغو":
+        context.user_data.clear()
+        await update.message.reply_text("لغو شد. برای شروع دوباره /start را بزنید.")
+        return
+
+
+    if text in PROVINCES:
+        context.user_data["province"] = text
+        context.user_data.pop("city", None)
+        await update.message.reply_text(
+            f"📍 استان {text} انتخاب شد.\nشهر خود را انتخاب کنید:",
+            reply_markup=cities_keyboard(text)
+        )
+        return
+
+
+    if text == "🔙 بازگشت به استان‌ها":
+        context.user_data.pop("province", None)
+        context.user_data.pop("city", None)
+        await update.message.reply_text("استان خود را انتخاب کنید:", reply_markup=provinces_keyboard())
+        return
+
+
+    if province and text in PROVINCES.get(province, []):
+        context.user_data["city"] = text
+        await update.message.reply_text(
+            f"🏙 شهر {text} انتخاب شد.\nبرای چه زمانی گزارش را می‌خواهید؟",
+            reply_markup=time_keyboard()
+        )
+        return
+
+
+    if text == "🔙 تغییر شهر" or text == "🏙 تغییر شهر":
+        if province:
+            await update.message.reply_text("شهر خود را انتخاب کنید:", reply_markup=cities_keyboard(province))
+        else:
+            await update.message.reply_text("استان را انتخاب کنید:", reply_markup=provinces_keyboard())
+        return
+
+
+    if text == "📍 تغییر استان":
+        context.user_data.clear()
+        await update.message.reply_text("استان خود را انتخاب کنید:", reply_markup=provinces_keyboard())
+        return
+
+
+    if text == "🔄 بررسی زمان دیگر":
+        if city:
+            await update.message.reply_text("زمان موردنظر را انتخاب کنید:", reply_markup=time_keyboard())
+        else:
+            await update.message.reply_text("اول استان و شهر را انتخاب کنید:", reply_markup=provinces_keyboard())
+        return
+
+
+    if text in TIME_OPTIONS:
+        province = context.user_data.get("province")
+        city = context.user_data.get("city")
+        if not city or not province:
+            await update.message.reply_text("ابتدا استان و شهر را انتخاب کنید.", reply_markup=provinces_keyboard())
+            return
+
+        await update.message.reply_text("⏳ در حال دریافت پیش‌بینی هوا...", reply_markup=time_keyboard())
+        weather = fetch_weather(city, TIME_OPTIONS[text])
+        if not weather:
+            await update.message.reply_text("❌ دریافت اطلاعات ناموفق بود. کمی بعد دوباره امتحان کنید.", reply_markup=time_keyboard())
+            return
+
+        rating, rating_text = observation_rating(weather["clouds"], weather["rain"], weather["wind"])
+        dt = datetime.fromisoformat(weather["datetime"])
+        date_text = dt.strftime("%Y-%m-%d")
+        report = (
+            "━━━━━━━━━━━━━━━━━━\n"
+            "🌌 گزارش وضعیت آسمان\n"
+            "━━━━━━━━━━━━━━━━━━\n\n"
+            f"📍 استان: {province}\n🏙 شهر: {city}\n"
+            f"📅 تاریخ: {date_text}\n🕘 ساعت پیش‌بینی: {dt.strftime('%H:%M')}\n\n"
+            f"🌤 وضعیت: {WEATHER_CODES.get(weather['code'], 'وضعیت نامشخص')}\n"
+            f"🌡 دما: {weather['temperature'] if weather['temperature'] is not None else '—'}°C\n"
+            f"💧 رطوبت: {weather['humidity'] if weather['humidity'] is not None else '—'}٪\n"
+            f"☁️ پوشش ابر: {weather['clouds'] if weather['clouds'] is not None else '—'}٪\n"
+            f"🌧 احتمال بارندگی: {weather['rain'] if weather['rain'] is not None else '—'}٪\n"
+            f"💨 سرعت باد: {weather['wind'] if weather['wind'] is not None else '—'} km/h\n\n"
+            "━━━━━━━━━━━━━━━━━━\n🔭 تخمین شرایط رصد\n━━━━━━━━━━━━━━━━━━\n\n"
+            f"⭐ نتیجه: {rating}\n{rating_text}\n\n"
+            "ℹ️ این فقط تخمین بر اساس پیش‌بینی هواست؛ تضمین دیدن ستاره‌ها نیست.\n"
+            "━━━━━━━━━━━━━━━━━━"
+        )
+        await update.message.reply_text(report, reply_markup=result_keyboard())
+        return
+
+
+    await update.message.reply_text("لطفاً از دکمه‌های کیبورد استفاده کنید یا /start را بزنید.")
+
+
+
+async def main():
+    if not BOT_TOKEN:
+        raise RuntimeError("BOT_TOKEN environment variable is missing. Set it in your hosting platform secrets.")
+    app = Application.builder().token(BOT_TOKEN).build()
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    log.info("Bot started; polling Telegram...")
+    await app.run_polling()
+
+
+
+if __name__ == "__main__":
+    import asyncio
+    asyncio.run(main())
