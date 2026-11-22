@@ -1,5 +1,6 @@
 import os
 import json
+import math
 import logging
 import requests
 
@@ -33,6 +34,13 @@ logging.basicConfig(
 )
 
 log = logging.getLogger(__name__)
+
+# ==================================================
+# ثابت‌های محاسبه فاز ماه
+# ==================================================
+
+SYNODIC_MONTH = 29.53058867
+REFERENCE_NEW_MOON = datetime(2000, 1, 6, 18, 14, tzinfo=ZoneInfo("UTC"))
 
 # ==================================================
 # ۳۱ استان ایران
@@ -221,6 +229,53 @@ def normalize_text(text):
     text = text.replace("  ", " ")
 
     return text.strip()
+
+# ==================================================
+# محاسبه وضعیت هلال ماه
+# ==================================================
+
+def get_moon_status(target_datetime_str, timezone_name):
+    try:
+        dt = datetime.fromisoformat(target_datetime_str)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=ZoneInfo(timezone_name))
+
+        dt_utc = dt.astimezone(ZoneInfo("UTC"))
+
+        age_days = (dt_utc - REFERENCE_NEW_MOON).total_seconds() / 86400.0
+        age_days = age_days % SYNODIC_MONTH
+
+        phase_ratio = age_days / SYNODIC_MONTH
+        illumination = round(0.5 * (1 - math.cos(2 * math.pi * phase_ratio)) * 100)
+
+        if age_days < 1.0:
+            status = "ماه نو (محاق) 🌑"
+            note = "هلال قابل مشاهده نیست."
+        elif age_days < 7.4:
+            status = "هلال افزایشی 🌒"
+            note = "هلال در آسمان وجود دارد و در حال بزرگ شدن است."
+        elif age_days < 14.8:
+            status = "تربیع اول تا ماه کامل 🌓"
+            note = "نیمه ماه روشن است."
+        elif age_days < 22.1:
+            status = "ماه کامل تا تربیع آخر 🌕"
+            note = "ماه تقریباً کامل است."
+        elif age_days < 28.5:
+            status = "هلال کاهشی 🌘"
+            note = "هلال در حال کوچک شدن است."
+        else:
+            status = "ماه نو (محاق) 🌑"
+            note = "هلال قابل مشاهده نیست."
+
+        return {
+            "status": status,
+            "illumination": illumination,
+            "age": round(age_days, 1),
+            "note": note
+        }
+    except Exception as e:
+        log.error("Moon calculation error: %s", e)
+        return None
 
 # ==================================================
 # پیدا کردن مختصات شهر
@@ -701,6 +756,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             weather["wind"],
         )
 
+        moon_info = get_moon_status(
+            weather["datetime"],
+            weather["timezone"],
+        )
+
         dt = datetime.fromisoformat(weather["datetime"])
 
         report = (
@@ -722,6 +782,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "━━━━━━━━━━━━━━━━━━\n\n"
             f"⭐ نتیجه: {rating}\n"
             f"{rating_text}\n\n"
+            "━━━━━━━━━━━━━━━━━━\n"
+            "🌙 وضعیت هلال ماه\n"
+            "━━━━━━━━━━━━━━━━━━\n\n"
+            f"🌘 وضعیت: {moon_info['status'] if moon_info else 'نامشخص'}\n"
+            f"💡 درصد روشنایی: {moon_info['illumination'] if moon_info else '—'}٪\n"
+            f"📅 سن ماه: {moon_info['age'] if moon_info else '—'} روز\n"
+            f"{moon_info['note'] if moon_info else ''}\n\n"
             "ℹ️ این گزارش بر اساس پیش‌بینی هواست "
             "و تضمین‌کننده صاف بودن واقعی آسمان نیست.\n"
             "━━━━━━━━━━━━━━━━━━"
