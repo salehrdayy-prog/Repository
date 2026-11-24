@@ -25,5 +25,6 @@ jobs:
           fi
 
       - name: Run bot
-        run: |
-          python bot.py
+        env:
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+        run: python bot.py
