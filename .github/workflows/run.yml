@@ -2,12 +2,16 @@ name: Sky Forecast Bot
 
 on:
   schedule:
-    - cron: '0 */6 * * *'
+    - cron: '0 */5 * * *' # هر ۵ ساعت یک بار استارت می‌زنه
   workflow_dispatch:
 
 jobs:
   run-bot:
     runs-on: ubuntu-latest
+    timeout-minutes: 350 # حداکثر زمان اجرا رو ۵ ساعت و ۵۰ دقیقه تنظیم می‌کنیم
+    concurrency: 
+      group: bot-group
+      cancel-in-progress: false # اجازه میده اجرای جدید توی صف بمونه تا قبلی تموم بشه
 
     steps:
       - name: Checkout repository
